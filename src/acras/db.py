@@ -21,11 +21,13 @@ SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 
 def connect(database_url: str) -> Connection:
     """Open a connection with dict rows. Caller owns the transaction."""
-    return psycopg.connect(database_url, row_factory=dict_row, autocommit=False)
+    return psycopg.connect(database_url, row_factory=dict_row, autocommit=False, connect_timeout=5)
 
 
 def run_migrations(conn: Connection, sql_dir: Path = SQL_DIR) -> list[str]:
     """Apply any .sql file in sql_dir that has not been applied yet."""
+    if not sql_dir.is_dir():
+        raise FileNotFoundError("SQL migration directory is missing; run from the editable checkout")
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -81,6 +83,21 @@ def insert_many(
 
 
 # --------------------------------------------------------------- bookkeeping
+
+
+def committed_windows(
+    conn: Connection, extractor: str, scope_key: str, start: datetime, end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Committed coverage overlapping this request, including disjoint ranges."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """select window_from, window_to from ingest_run
+                where extractor = %s and scope_key = %s and status = 'ok'
+                  and window_from < %s and window_to > %s
+                order by window_from""",
+            (extractor, scope_key, end, start),
+        )
+        return [(row["window_from"], row["window_to"]) for row in cur.fetchall()]
 
 
 def resume_point(conn: Connection, extractor: str, scope_key: str) -> datetime | None:

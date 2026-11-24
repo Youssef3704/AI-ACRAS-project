@@ -7,9 +7,19 @@ environment. See .env.example.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+
+
+PROJECT_STATION = "ACRAS2-8"
+
+
+def require_project_station(name: str) -> str:
+    """Keep the project's extraction scope limited to the selected station."""
+    if name != PROJECT_STATION:
+        raise ValueError(f"This project only supports station {PROJECT_STATION}")
+    return name
 
 
 def _env(name: str, default: str | None = None, *, required: bool = False) -> str:
@@ -24,9 +34,9 @@ def _env(name: str, default: str | None = None, *, required: bool = False) -> st
 
 @dataclass(frozen=True)
 class Config:
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str
-    database_url: str
+    database_url: str = field(repr=False)
     data_dir: Path
 
     # Per-request window sizes, tuned to the measured payload sizes:
@@ -40,6 +50,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        require_project_station(_env("ACRAS_STATION_NAME", PROJECT_STATION))
         return cls(
             api_key=_env("ACRAS_API_KEY", required=True),
             base_url=_env("ACRAS_BASE_URL", "https://acras.iav.ch/api").rstrip("/"),
