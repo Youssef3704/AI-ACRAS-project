@@ -25,7 +25,7 @@ from typing import Any, Iterator, Sequence
 from psycopg import Connection
 
 from .. import db
-from ..api import AcrasClient
+from ..api import AcrasClient, stamp
 from ..config import Config
 
 log = logging.getLogger(__name__)
@@ -62,9 +62,8 @@ def iter_windows(
 ) -> Iterator[tuple[datetime, datetime]]:
     """Split [start, end) into half-open chunks of at most `size`.
 
-    Half-open is what keeps windows from double-counting the boundary instant:
-    the API treats `to` as inclusive, so each window ends one second short and
-    the next one starts where it left off.
+    Adapters request the full end bound and filter responses to [start, end).
+    This handles an inclusive API `to` without dropping subsecond observations.
     """
     if size <= timedelta(0):
         raise ValueError("window size must be positive")
@@ -73,6 +72,23 @@ def iter_windows(
         stop = min(cursor + size, end)
         yield cursor, stop
         cursor = stop
+
+
+def uncovered_ranges(
+    start: datetime, end: datetime, covered: Sequence[tuple[datetime, datetime]]
+) -> Iterator[tuple[datetime, datetime]]:
+    """Subtract successful coverage without skipping earlier gaps or backfills."""
+    cursor = start
+    for lower, upper in sorted(covered):
+        if upper <= cursor or lower >= end:
+            continue
+        if lower > cursor:
+            yield cursor, lower
+        cursor = max(cursor, upper)
+        if cursor >= end:
+            return
+    if cursor < end:
+        yield cursor, end
 
 
 class Extractor(ABC):
@@ -121,21 +137,22 @@ class StaticExtractor(Extractor):
             rows = self.to_rows(payload)
             stats.rows_seen = len(rows)
             stats.rows_written = self._write(rows)
-            self.conn.commit()
+            # Commit data and the success audit together. Otherwise a crash
+            # between their commits can leave the progress log behind the data.
+            db.finish_run(
+                self.conn, run_id, status="ok",
+                rows_seen=stats.rows_seen, rows_written=stats.rows_written,
+            )
         except Exception as exc:
             self.conn.rollback()
-            db.finish_run(self.conn, run_id, status="failed", error=str(exc))
+            stats.rows_written = 0
+            db.finish_run(
+                self.conn, run_id, status="failed", rows_seen=stats.rows_seen, error=str(exc)
+            )
             stats.failures.append(f"{self.name}: {exc}")
             log.exception("%s failed", self.name)
             return stats
 
-        db.finish_run(
-            self.conn,
-            run_id,
-            status="ok",
-            rows_seen=stats.rows_seen,
-            rows_written=stats.rows_written,
-        )
         log.info("%s: %s", self.name, stats)
         return stats
 
@@ -173,8 +190,14 @@ class WindowedExtractor(Extractor):
         *,
         resume: bool = True,
     ) -> Stats:
+        stamp(start)
+        stamp(end)
+        if start >= end:
+            raise ValueError("start must be earlier than end")
+        if not scopes:
+            raise ValueError("At least one scope is required")
         total = Stats()
-        for scope in scopes:
+        for scope in dict.fromkeys(scopes):
             total += self._run_scope(scope, start, end, resume=resume)
         return total
 
@@ -183,21 +206,10 @@ class WindowedExtractor(Extractor):
     ) -> Stats:
         stats = Stats()
 
-        effective_start = start
-        if resume:
-            mark = db.resume_point(self.conn, self.name, scope)
-            if mark and mark > effective_start:
-                log.info(
-                    "%s[%s]: resuming at %s (requested %s)",
-                    self.name, scope, mark.isoformat(), start.isoformat(),
-                )
-                effective_start = mark
-        if effective_start >= end:
-            log.info("%s[%s]: already up to date", self.name, scope)
-            return stats
-
-        for win_start, win_end in iter_windows(effective_start, end, self.window):
-            stats += self._run_window(scope, win_start, win_end)
+        covered = db.committed_windows(self.conn, self.name, scope, start, end) if resume else []
+        for missing_start, missing_end in uncovered_ranges(start, end, covered):
+            for win_start, win_end in iter_windows(missing_start, missing_end, self.window):
+                stats += self._run_window(scope, win_start, win_end)
 
         log.info("%s[%s]: %s", self.name, scope, stats)
         return stats
@@ -212,12 +224,18 @@ class WindowedExtractor(Extractor):
             rows = self.to_rows(scope, payload, start, end)
             stats.rows_seen = len(rows)
             stats.rows_written = self._write(rows)
-            self.conn.commit()
+            db.finish_run(
+                self.conn, run_id, status="ok",
+                rows_seen=stats.rows_seen, rows_written=stats.rows_written,
+            )
         except Exception as exc:
             # Roll back the data first so the audit row commits cleanly and the
             # failure is not erased along with the partial write.
             self.conn.rollback()
-            db.finish_run(self.conn, run_id, status="failed", error=repr(exc))
+            stats.rows_written = 0
+            db.finish_run(
+                self.conn, run_id, status="failed", rows_seen=stats.rows_seen, error=repr(exc)
+            )
             stats.failures.append(f"{self.name}[{scope}] {start.isoformat()}: {exc}")
             log.error(
                 "%s[%s] window %s..%s failed: %s",
@@ -225,13 +243,6 @@ class WindowedExtractor(Extractor):
             )
             return stats
 
-        db.finish_run(
-            self.conn,
-            run_id,
-            status="ok",
-            rows_seen=stats.rows_seen,
-            rows_written=stats.rows_written,
-        )
         log.info(
             "%s[%s] %s..%s: %d seen, %d written",
             self.name, scope, start.isoformat(), end.isoformat(),

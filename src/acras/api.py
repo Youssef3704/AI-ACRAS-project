@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -25,7 +25,11 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 def stamp(moment: datetime) -> str:
     """Format a datetime the way the ACRAS query parameters expect."""
-    return moment.strftime(TIMESTAMP_FORMAT)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("Query timestamps must include a timezone")
+    if moment.microsecond:
+        raise ValueError("Query timestamps must use whole seconds")
+    return moment.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT)
 
 
 class AcrasApiError(RuntimeError):
