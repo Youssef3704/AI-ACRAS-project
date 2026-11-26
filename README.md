@@ -53,7 +53,7 @@ Use Python 3.10 or newer:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev,storage]"
+python -m pip install -e ".[dev,storage,analysis]"
 ```
 
 Use the editable checkout so migrations can find the root SQL directory.
