@@ -13,3 +13,4 @@ data/*
 !data/sonic/
 data/sonic/*
 !data/sonic/.gitkeep
+.venv
